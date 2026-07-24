@@ -130,6 +130,16 @@ class BackupReliabilityTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertTrue(error)
 
+    def test_occupied_source_file_fails_safely_after_retries(self):
+        engine = self.configured_engine()
+        engine.RETRY_DELAY_SECONDS = 0
+        with patch("shutil.copy2", side_effect=PermissionError("file is busy")):
+            ok, error = engine._copy_and_verify_with_retry(
+                str(self.source), str(self.target / "occupied.jpg"), "source-hash", enable_verify=False
+            )
+        self.assertFalse(ok)
+        self.assertIn("file is busy", error)
+
     def test_network_notification_failure_does_not_interrupt_local_workflow(self):
         previous_url = backup.config.webhook_url
         backup.config.webhook_url = "http://127.0.0.1:1/unavailable"
@@ -153,6 +163,25 @@ class BackupReliabilityTests(unittest.TestCase):
             self.assertEqual(engine.progress.status, "partial")
             self.assertFalse(engine.progress.can_cleanup)
             self.assertIn("原始 SD 卡", engine.progress.current_file)
+        finally:
+            backup.scan_sd_card = original_scan
+            backup.batch_extract_metadata = original_metadata
+
+    def test_target_disconnect_is_recorded_as_partial_with_report(self):
+        original_scan = backup.scan_sd_card
+        original_metadata = backup.batch_extract_metadata
+        backup.scan_sd_card = lambda _mount: [self.media_file()]
+        backup.batch_extract_metadata = lambda files, _progress: files
+        try:
+            engine = self.configured_engine()
+            engine._copy_to_target = Mock(side_effect=OSError("目标磁盘突然断开"))
+            engine.run(str(self.sd), "target-disconnect", str(self.target), enable_verify=False)
+            self.assertEqual(engine.progress.status, "partial")
+            self.assertFalse(engine.progress.can_cleanup)
+            history = db.get_backups(limit=1)[0]
+            self.assertEqual(history["failed_files"], 1)
+            self.assertTrue(Path(history["report_path"]).is_file())
+            self.assertEqual(json.loads(Path(history["report_path"]).read_text())["failed_files"], 1)
         finally:
             backup.scan_sd_card = original_scan
             backup.batch_extract_metadata = original_metadata
